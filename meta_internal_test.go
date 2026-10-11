@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -604,5 +605,80 @@ func TestMetaModeKnownOnceAnEntryIsApplied(t *testing.T) {
 	data := wal.Entry{ID: 1, Revision: 1, Term: 1, Op: wal.OpCreate, Key: "/k", Value: []byte("v")}
 	if on, known := mode(data); on || !known {
 		t.Fatalf("a first entry that is not the marker: on=%v known=%v, want known off", on, known)
+	}
+}
+
+// TestFollowerLearnsMetaModeOfLeaderInGenesis checks that a follower which
+// joins while its leader is still creating the database learns the meta mode
+// the leader fixes, instead of taking the database for a legacy one and
+// forwarding lease and auth state as data keys that meta readers never see.
+func TestFollowerLearnsMetaModeOfLeaderInGenesis(t *testing.T) {
+	shared := object.NewMem()
+	cfg := func(i int) Config {
+		return Config{
+			DataDir:        t.TempDir(),
+			ObjectStore:    shared,
+			NodeID:         fmt.Sprintf("genesis-node-%d", i),
+			PeerListenAddr: freeAddrLocal(t),
+		}
+	}
+
+	reached, release := make(chan struct{}), make(chan struct{})
+	hook := func() { close(reached); <-release }
+	testhook.BeforeMetaGenesis.Store(&hook)
+	t.Cleanup(func() { testhook.BeforeMetaGenesis.Store(nil) })
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	type opened struct {
+		n   *Node
+		err error
+	}
+	leaderC := make(chan opened, 1)
+	go func() {
+		n, err := Open(cfg(0))
+		leaderC <- opened{n, err}
+	}()
+	select {
+	case <-reached:
+	case o := <-leaderC:
+		t.Fatalf("leader Open returned before genesis: %v", o.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("leader did not reach genesis")
+	}
+	testhook.BeforeMetaGenesis.Store(nil)
+
+	follower, err := Open(cfg(1))
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	t.Cleanup(func() { _ = follower.Close() })
+	if follower.loadRole() != roleFollower {
+		t.Fatal("second node did not become a follower")
+	}
+
+	ctx := metaCtx(t)
+	modeC := make(chan opened, 1)
+	go func() {
+		on, err := follower.MetaEnabledSync(ctx)
+		if err == nil && !on {
+			err = errors.New("follower took the new database for a legacy one")
+		}
+		modeC <- opened{err: err}
+	}()
+	select {
+	case o := <-modeC:
+		t.Fatalf("MetaEnabledSync answered before the leader fixed the mode: %v", o.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	o := <-leaderC
+	if o.err != nil {
+		t.Fatalf("open leader: %v", o.err)
+	}
+	t.Cleanup(func() { _ = o.n.Close() })
+	if o := <-modeC; o.err != nil {
+		t.Fatalf("follower MetaEnabledSync: %v", o.err)
 	}
 }

@@ -390,6 +390,18 @@ func (n *Node) HandleForward(ctx context.Context, req *peer.ForwardRequest) (*pe
 		return &peer.ForwardResponse{Succeeded: err == nil, ErrCode: code, ErrMsg: msg}, nil
 
 	case peer.ForwardGetSequence:
+		// A follower that has applied no entry asks for this to learn the
+		// meta mode, which a new database fixes in Open after this server
+		// starts. Answering 0 before then would let the follower take the
+		// database for a legacy one and forward lease and auth state as
+		// data keys, committed after the format marker.
+		select {
+		case <-n.metaGenesisDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-n.bgCtx.Done():
+			return nil, ErrClosed
+		}
 		// The ReadIndex of a follower's meta read: like ForwardGetRevision
 		// it needs the lease.
 		if err := n.checkLease(); err != nil {
