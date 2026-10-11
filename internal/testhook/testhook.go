@@ -15,3 +15,8 @@ var LegacyNewDatabases atomic.Bool
 // instead of executing them. Tests use it to check that followers on this
 // release stay compatible with a leader that has not been upgraded yet.
 var V1Leader atomic.Bool
+
+// BeforeMetaGenesis, if set, runs in Open on a leader just before it fixes the
+// meta mode of a new database, with the peer server already serving. Tests
+// use it to hold a leader in that window.
+var BeforeMetaGenesis atomic.Pointer[func()]

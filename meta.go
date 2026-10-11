@@ -143,6 +143,9 @@ func (n *Node) initMetaAtGenesis(ctx context.Context) (err error) {
 	if testhook.LegacyNewDatabases.Load() {
 		return nil
 	}
+	if hook := testhook.BeforeMetaGenesis.Load(); hook != nil {
+		(*hook)()
+	}
 	// Held exclusively until the marker is acknowledged: this drains writes
 	// already in flight, so LastSequence covers every queued entry, and keeps
 	// later writes behind the marker. stepDown and shutdown wait for it as

@@ -233,6 +233,10 @@ type Node struct {
 	resolvedMetaToken uint64
 	// metaModeCache caches the meta keyspace mode once known (see metaMode).
 	metaModeCache atomic.Int32
+	// metaGenesisDone is closed once Open has fixed the meta mode of a new
+	// database (see initMetaAtGenesis). Until then a leader holds back the
+	// sequence followers ask for to learn the mode.
+	metaGenesisDone chan struct{}
 	// pendingMeta holds in-flight meta keyspace writes; metaTokenSeq issues
 	// their tokens. Protected by mu.
 	pendingMeta  map[string]pendingMeta
@@ -758,6 +762,8 @@ func Open(cfg Config) (*Node, error) {
 		writeC:      make(chan *writeReq, 1024),
 		sstUploader: sstUp,
 		fenceReqC:   make(chan struct{}, 1),
+
+		metaGenesisDone: make(chan struct{}),
 	}
 	n.fence.done = make(chan struct{})
 	n.log = log
@@ -806,10 +812,12 @@ func Open(cfg Config) (*Node, error) {
 		n.bgWg.Add(1)
 		go func() { defer n.bgWg.Done(); n.commitLoop(bgCtx) }()
 		if err := n.initMetaAtGenesis(bgCtx); err != nil {
+			close(n.metaGenesisDone)
 			_ = n.Close()
 			return nil, err
 		}
 	}
+	close(n.metaGenesisDone)
 	if n.loadRole() != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
 		n.bgWg.Add(1)
 		go func() { defer n.bgWg.Done(); n.checkpointLoop(bgCtx) }()
