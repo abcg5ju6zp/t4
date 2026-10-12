@@ -885,7 +885,10 @@ is skipped unconditionally — even if it falls outside the `--keep` window. The
 orphan deletion.
 
 - Call `t4 branch fork` **before** running GC on the source.
-- Call `t4 branch unfork` only after the branch node is fully decommissioned.
+- Decommission with `t4 branch unfork --branch-s3-prefix <branch prefix>`: it solidifies the still-referenced
+  ancestor SSTs into the branch prefix and releases the registration only after a verified independent checkpoint;
+  in-flight (`solidifying`) handoffs keep full GC protection. It is safe to rerun and safe against a
+  running or restarting branch.
 
 ---
 
@@ -977,19 +980,40 @@ if err := checkpoint.RegisterBranch(ctx, sourceStore, "my-branch", cpKey); err !
 }
 ```
 
-### Removing a branch
+### Removing a branch (recoverable handoff)
 
-When the branch is no longer needed, unregister it so the source's GC can reclaim unused SSTs:
+Decommissioning does not delete the source registration outright. A branch checkpoint references the SSTs it
+still shares with the source as *ancestor SSTs*; deleting the registration first would let the next
+source GC reclaim SSTs the running branch — or its restart from its own checkpoint — still needs.
+
+`t4 branch unfork` instead runs a recoverable handoff:
+
+1. **Pin.** The branch identity (`--branch-id` plus a random handoff id), the ancestor checkpoint, and
+   the branch's current checkpoint revision are fixed in both stores. The source entry moves to
+   `solidifying`; GC keeps protecting it like an active fork.
+2. **Solidify.** Ancestor SSTs the branch head still references are copied (hash-verified,
+   content-addressed) into the branch prefix, and the branch manifest head becomes a fully-local,
+   verifiable checkpoint. A running branch node sees the handoff marker and promotes its inherited
+   SSTs at the next checkpoint; later checkpoints (also after restart) stay independent.
+3. **Release.** Only after the independent head verifies is the source registration released; GC may
+   then reclaim the ancestor checkpoint and SSTs.
 
 ```bash
 t4 branch unfork \
   --s3-bucket my-bucket \
   --s3-prefix t4/ \
+  --branch-s3-prefix t4-branch/ \
   --branch-id my-branch
 ```
 
+The command is idempotent: rerun after any interruption to resume the same handoff, and duplicate
+decommission / an already-independent branch return immediately. Add `--status` to inspect a handoff
+without modifying anything.
+
 ```go
-if err := t4.Unfork(ctx, sourceStore, "my-branch"); err != nil {
+// sourceStore is the store the fork was registered in; branchStore is the
+// branch node's own object store.
+if _, err := t4.Unfork(ctx, sourceStore, branchStore, "my-branch"); err != nil {
     log.Fatal(err)
 }
 ```

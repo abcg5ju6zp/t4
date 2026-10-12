@@ -70,7 +70,14 @@ This command does not require a running node — it reads directly from S3.`,
 				fmt.Printf("  (none)\n")
 			} else {
 				for id, entry := range branches {
-					fmt.Printf("  %-30s  pinned at: %s\n", id, entry.AncestorCheckpointKey)
+					state := ""
+					switch entry.State {
+					case "solidifying":
+						state = "  [decommission in progress]"
+					case "released":
+						state = "  [released: GC pending]"
+					}
+					fmt.Printf("  %-30s  pinned at: %s%s\n", id, entry.AncestorCheckpointKey, state)
 				}
 			}
 

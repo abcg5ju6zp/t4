@@ -917,15 +917,41 @@ func (n *Node) runCheckpoint(ctx context.Context) (int64, bool) {
 	n.fenceMu.Unlock()
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
+	// While a branch decommission handoff is active, stop classifying
+	// inherited SSTs as ancestor-owned before writing anything. The
+	// checkpoint about to be written must itself be independent of the
+	// source store the handoff is releasing.
+	promoted := false
+	if n.branchHandoff != nil {
+		ok, berr := n.branchHandoff.beforeCheckpoint(ctx)
+		if berr != nil {
+			n.log.Errorf("t4: branch handoff before checkpoint: %v", berr)
+			return 0, false
+		}
+		promoted = ok
+	}
+
 	if n.sstUploader != nil {
 		n.sstUploader.Wait()
 		if err := n.cp.WriteDirWithRegistry(ctx, cpDir, n.cfg.ObjectStore, n.term, rev, seq, "", n.sstUploader.Registry(), n.sstUploader.InheritedRegistry(), cpFormat); err != nil {
 			n.log.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
 			return 0, false
 		}
-	} else if err := n.cp.WriteDir(ctx, cpDir, n.cfg.ObjectStore, n.term, rev, seq, "", n.cfg.AncestorStore, cpFormat); err != nil {
-		n.log.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
-		return 0, false
+	} else {
+		ancestorStore := n.cfg.AncestorStore
+		if promoted {
+			// All inherited SSTs are local now (uploaded below
+			// inline), so the index must not look them up in the
+			// ancestor store.
+			ancestorStore = nil
+		}
+		if err := n.cp.WriteDir(ctx, cpDir, n.cfg.ObjectStore, n.term, rev, seq, "", ancestorStore, cpFormat); err != nil {
+			n.log.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
+			return 0, false
+		}
+	}
+	if promoted {
+		n.branchHandoff.afterCheckpoint(ctx, n.term, rev)
 	}
 	// Only discount the covered entries once the checkpoint is durable: a
 	// failed upload leaves the counter non-zero so the next tick retries, and

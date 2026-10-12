@@ -136,6 +136,72 @@ func (u *SSTUploader) SetInherited(filenames map[string]string) {
 	}
 }
 
+// HasInherited reports whether inherited (ancestor-store) SSTs are still
+// classified as inherited. A branch node consults this to decide whether it
+// must react to a decommission handoff before its next checkpoint.
+func (u *SSTUploader) HasInherited() bool {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return len(u.inherited) > 0
+}
+
+// PromoteInherited makes every inherited (ancestor-store) SST the branch
+// still needs its own object in this store: tables still on disk are
+// uploaded to their content-addressed key, then moved into the local
+// registry, so the next checkpoint indexes them as SSTFiles instead of
+// AncestorSSTFiles. Tables Pebble has already compacted away are simply
+// dropped from the inherited set — no checkpoint can reference them.
+//
+// Used by a branch node when its unfork handoff begins; safe to call
+// more than once and while no checkpoint is in flight (callers hold the
+// checkpoint lock).
+func (u *SSTUploader) PromoteInherited(ctx context.Context) (int, error) {
+	u.mu.RLock()
+	inherited := make(map[string]string, len(u.inherited))
+	for name, key := range u.inherited {
+		inherited[name] = key
+	}
+	u.mu.RUnlock()
+	if len(inherited) == 0 {
+		return 0, nil
+	}
+
+	promoted := make(map[string]string)
+	for name := range inherited {
+		path := filepath.Join(u.pebbleDir, name)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				// Compacted away: no checkpoint can still reference it.
+				continue
+			}
+			return 0, fmt.Errorf("sstuploader: stat inherited %q: %w", name, err)
+		}
+		if err := u.uploadOne(ctx, path); err != nil {
+			return 0, err
+		}
+		promoted[name] = inherited[name]
+	}
+
+	u.mu.Lock()
+	for name, key := range promoted {
+		// uploadOne registered it locally under its content key; only
+		// remove the inherited classification so the local one wins.
+		delete(u.inherited, name)
+		if _, ok := u.local[name]; !ok {
+			u.local[name] = key
+		}
+	}
+	// Tables compacted away before promotion are no longer referenced by
+	// checkpoints; drop their inherited entries too.
+	for name := range inherited {
+		if _, ok := promoted[name]; !ok {
+			delete(u.inherited, name)
+		}
+	}
+	u.mu.Unlock()
+	return len(promoted), nil
+}
+
 // Reconcile walks pebbleDir and uploads any SST files not already in the
 // registry. Must be called after Pebble opens and before serving requests.
 func (u *SSTUploader) Reconcile(ctx context.Context) error {

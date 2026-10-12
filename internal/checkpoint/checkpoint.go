@@ -740,6 +740,14 @@ func (mgr *Manager) GCCheckpoints(ctx context.Context, store object.Store, keep 
 	}
 	pinnedKeys := make(map[string]bool, len(branches))
 	for _, entry := range branches {
+		// A released tombstone is the terminal state of an unfork handoff:
+		// the branch published a verified, fully-local checkpoint, so its
+		// ancestor checkpoint and SSTs are no longer protected. Entries in
+		// the "solidifying" state stay pinned exactly like active ones — the
+		// handoff must not release protection before it is confirmed.
+		if entry.Released() {
+			continue
+		}
 		if entry.AncestorCheckpointKey != "" {
 			pinnedKeys[entry.AncestorCheckpointKey] = true
 		}

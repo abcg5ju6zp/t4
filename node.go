@@ -286,6 +286,7 @@ type Node struct {
 	sstSweepTerm           uint64              // term sstSweepMarks was collected under; guarded by checkpointMu
 	checkpointShutdownWait time.Duration       // how long graceful shutdown waits for an in-flight checkpoint
 	sstUploader            *istore.SSTUploader // non-nil when ObjectStore is set; streams SSTs to S3
+	branchHandoff          *branchHandoff      // non-nil on branch nodes; promotes inherited SSTs during unfork
 	lastRevisionSampleUnix int64               // unix nano timestamp of newest local revision/time sample
 	tracer                 trace.Tracer
 	tracing                bool // Config.TracerProvider was set
@@ -768,6 +769,9 @@ func Open(cfg Config) (*Node, error) {
 	n.fence.done = make(chan struct{})
 	n.log = log
 	n.cp = cp
+	if n.branchNode() {
+		n.branchHandoff = newBranchHandoff(n)
+	}
 	n.db.Store(db)
 	if cfg.NodeID != "" {
 		if err := db.SetNodeID(cfg.NodeID); err != nil {
@@ -821,6 +825,12 @@ func Open(cfg Config) (*Node, error) {
 	if n.loadRole() != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
 		n.bgWg.Add(1)
 		go func() { defer n.bgWg.Done(); n.checkpointLoop(bgCtx) }()
+	}
+	// Branch nodes watch for decommission markers so inherited SSTs are
+	// promoted on the next checkpoint instead of waiting for the interval.
+	if n.branchHandoff != nil && n.loadRole() != roleFollower {
+		n.bgWg.Add(1)
+		go func() { defer n.bgWg.Done(); n.branchHandoff.watchLoop(bgCtx) }()
 	}
 	if n.loadRole() != roleFollower && n.autoCompactEnabled() {
 		n.bgWg.Add(1)
