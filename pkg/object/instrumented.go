@@ -89,6 +89,24 @@ func (s *instrumentedStore) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *instrumentedStore) Stat(ctx context.Context, key string) error {
+	start := time.Now()
+	var err error
+	if st, ok := s.inner.(Stater); ok {
+		err = st.Stat(ctx, key)
+	} else {
+		// Decorated store cannot HEAD: fall back to a short GET so the
+		// Stater contract still holds for callers.
+		var rc io.ReadCloser
+		rc, err = s.inner.Get(ctx, key)
+		if err == nil {
+			_ = rc.Close()
+		}
+	}
+	record("stat", start, err)
+	return err
+}
+
 func (s *instrumentedStore) DeleteMany(ctx context.Context, keys []string) error {
 	start := time.Now()
 	err := s.inner.DeleteMany(ctx, keys)

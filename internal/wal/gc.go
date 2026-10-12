@@ -21,12 +21,35 @@ import (
 //
 // Returns the number of segments deleted.
 func GCSegments(ctx context.Context, store object.Store, checkpointSeq int64, log walLogger) (int, error) {
+	toDelete, err := DeletableSegments(ctx, store, checkpointSeq)
+	if err != nil {
+		return 0, err
+	}
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+	if err := store.DeleteMany(ctx, toDelete); err != nil {
+		log.Warnf("wal gc: delete: %v", err)
+		return 0, nil
+	}
+	for _, k := range toDelete {
+		log.Debugf("wal gc: deleted %q (covered by checkpoint seq=%d)", k, checkpointSeq)
+	}
+	return len(toDelete), nil
+}
+
+// DeletableSegments returns the WAL object keys whose entire sequence range
+// is covered by checkpointSeq, without deleting anything. The boundary rules
+// are identical to GCSegments; callers that persist a GC plan first (so a
+// later retry only touches the pinned list) use this instead of deleting
+// inline.
+func DeletableSegments(ctx context.Context, store object.Store, checkpointSeq int64) ([]string, error) {
 	keys, err := store.List(ctx, "wal/")
 	if err != nil {
-		return 0, fmt.Errorf("wal gc: list: %w", err)
+		return nil, fmt.Errorf("wal gc: list: %w", err)
 	}
 	if len(keys) < 2 {
-		return 0, nil // nothing or only one segment — nothing to GC
+		return nil, nil // nothing or only one segment — nothing to GC
 	}
 
 	// keys are returned sorted (lexicographic == chronological given our naming).
@@ -43,17 +66,7 @@ func GCSegments(ctx context.Context, store object.Store, checkpointSeq int64, lo
 			toDelete = append(toDelete, keys[i])
 		}
 	}
-	if len(toDelete) == 0 {
-		return 0, nil
-	}
-	if err := store.DeleteMany(ctx, toDelete); err != nil {
-		log.Warnf("wal gc: delete: %v", err)
-		return 0, nil
-	}
-	for _, k := range toDelete {
-		log.Debugf("wal gc: deleted %q (covered by checkpoint seq=%d)", k, checkpointSeq)
-	}
-	return len(toDelete), nil
+	return toDelete, nil
 }
 
 // parseFirstRev extracts the firstRev integer from a WAL object key of the

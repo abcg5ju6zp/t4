@@ -120,6 +120,19 @@ func (s *encryptedStore) Delete(ctx context.Context, key string) error {
 	return s.inner.Delete(ctx, key)
 }
 
+// Stat checks existence on the inner store. Keys are plaintext by design, so
+// no decryption is involved; the body is never read.
+func (s *encryptedStore) Stat(ctx context.Context, key string) error {
+	if st, ok := s.inner.(Stater); ok {
+		return st.Stat(ctx, key)
+	}
+	rc, err := s.inner.Get(ctx, key)
+	if err == nil {
+		_ = rc.Close()
+	}
+	return err
+}
+
 func (s *encryptedStore) DeleteMany(ctx context.Context, keys []string) error {
 	return s.inner.DeleteMany(ctx, keys)
 }

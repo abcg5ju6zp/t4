@@ -38,6 +38,16 @@ type Store interface {
 	List(ctx context.Context, prefix string) ([]string, error)
 }
 
+// Stater is an optional Store extension for cheap object-existence checks
+// (HEAD rather than GET). GC uses it to reconcile deletes whose outcome the
+// store did not confirm: before a retry it asks whether the object still
+// exists instead of issuing either a blind retry or a full GET.
+type Stater interface {
+	// Stat returns nil when key exists and ErrNotFound when it does not.
+	// Other errors are returned as-is.
+	Stat(ctx context.Context, key string) error
+}
+
 // GetWithETag wraps the result of a conditional-aware Get, pairing the body
 // with the ETag of the version that was read.
 type GetWithETag struct {

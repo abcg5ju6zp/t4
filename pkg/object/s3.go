@@ -338,6 +338,20 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Stat checks object existence with a HEAD request. GC calls it after a
+// delete whose result is uncertain (timeout, broken connection) so a retry
+// targets only objects the store still holds.
+func (s *S3Store) Stat(ctx context.Context, key string) error {
+	_, err := s.client.StatObject(ctx, s.bucket, s.key(key), minio.StatObjectOptions{})
+	if err != nil {
+		if isNotFound(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("object/s3: stat %q: %w", key, err)
+	}
+	return nil
+}
+
 func (s *S3Store) DeleteMany(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil

@@ -103,6 +103,16 @@ func (m *Mem) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (m *Mem) Stat(_ context.Context, key string) error {
+	m.mu.Lock()
+	_, ok := m.objects[key]
+	m.mu.Unlock()
+	if !ok {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (m *Mem) DeleteMany(_ context.Context, keys []string) error {
 	m.mu.Lock()
 	for _, k := range keys {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/t4db/t4/internal/checkpoint"
 	"github.com/t4db/t4/internal/election"
+	"github.com/t4db/t4/internal/gc"
 	"github.com/t4db/t4/internal/metrics"
 	"github.com/t4db/t4/internal/peer"
 	"github.com/t4db/t4/internal/testhook"
@@ -991,53 +992,99 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 	}
 	defer cancel()
 
-	// GC WAL segments from S3 that are fully covered by this checkpoint AND
-	// that all connected followers have applied. WAL segment boundaries and
-	// follower ACKs are sequence-based, while the checkpoint manifest still
-	// advertises the user-visible revision.
-	gcSeq := seq
-	if n.peerSrv != nil {
-		if minFollower := n.peerSrv.MinFollowerAppliedRev(); minFollower < gcSeq {
-			gcSeq = minFollower
-		}
-	}
-	deleted, gcErr := wal.GCSegments(gcCtx, n.cfg.ObjectStore, gcSeq, n.log)
-	if gcErr != nil {
-		n.log.Warnf("t4: wal gc: %v", gcErr)
-	} else if deleted > 0 {
-		metrics.WALGCTotal.Add(float64(deleted))
-		n.log.Infof("t4: wal gc: deleted %d segments (covered by checkpoint seq=%d)", deleted, gcSeq)
-	}
-
-	// GC old checkpoint archives from S3, keeping the 2 most recent so that
-	// any in-flight bootstrap that read manifest/latest just before we
-	// overwrote it can still fetch the previous checkpoint.
-	// GCCheckpoints deletes old checkpoint archives and returns the set of SST
-	// keys that were exclusively referenced by the deleted checkpoints. Passing
-	// that candidate set to GCOrphanSSTs (instead of listing all "sst/" keys)
-	// eliminates the race where a newly-promoted leader uploads SSTs before
-	// writing its first checkpoint — those SSTs never appear in any deleted
-	// checkpoint's index, so they are never mistakenly treated as orphans.
-	cpDeleted, orphanSSTs, cpGCErr := n.cp.GCCheckpoints(gcCtx, n.cfg.ObjectStore, 2)
-	if cpGCErr != nil {
-		n.log.Warnf("t4: checkpoint gc: %v", cpGCErr)
-	} else if cpDeleted > 0 {
-		n.log.Infof("t4: checkpoint gc: deleted %d old checkpoint(s)", cpDeleted)
-	}
-
-	// Only run SST GC when old checkpoints were actually deleted and there are
-	// candidate SSTs to clean up. This skips the Delete loop entirely when
-	// nothing changed, which is the common case.
-	if cpDeleted > 0 && len(orphanSSTs) > 0 {
-		sstDeleted, sstGCErr := n.cp.GCOrphanSSTs(gcCtx, n.cfg.ObjectStore, orphanSSTs)
-		if sstGCErr != nil {
-			n.log.Warnf("t4: sst gc: %v", sstGCErr)
-		} else if sstDeleted > 0 {
-			n.log.Infof("t4: sst gc: deleted %d orphan sst(s)", sstDeleted)
-		}
-	}
-
+	n.runObjectGC(gcCtx, seq)
 	n.sweepSSTs(gcCtx)
+}
+
+// runObjectGC runs checkpoint, orphan-SST and WAL GC as one resumable run.
+// The run pins at start: the manifest snapshot, the retained-checkpoint and
+// protected-SST sets, the follower-safe WAL horizon and this leadership
+// generation (term). Checkpoint directories, candidate SSTs and WAL segments
+// are journaled item by item in object storage, so a timeout, cancellation,
+// restart or term change resumes against the same pinned plan: ambiguous
+// deletes are verified against object facts, and only unconfirmed items are
+// retried. The phases advance in reference order (checkpoint → SST → WAL),
+// and a generation that has lost leadership stops without touching the next
+// generation's run. The two-round unreferenced-SST sweep stays separate
+// (sweepSSTs); its term-local marking rule is unchanged.
+func (n *Node) runObjectGC(gcCtx context.Context, seq int64) {
+	term := n.term
+	// WAL segment boundaries and follower ACKs are sequence-based, while the
+	// checkpoint manifest advertises the user-visible revision; GC segments
+	// covered by this checkpoint that all connected followers have applied.
+	horizon := func(context.Context) (int64, bool, error) {
+		h := seq
+		if n.peerSrv != nil {
+			if minFollower := n.peerSrv.MinFollowerAppliedRev(); minFollower < h {
+				h = minFollower
+			}
+		}
+		return h, true, nil
+	}
+	runner := gc.New(n.cp, n.cfg.ObjectStore, gc.Options{
+		Kind:       gc.KindAuto,
+		Term:       term,
+		Keep:       2,
+		WALHorizon: horizon,
+		LiveSSTs:   n.liveSSTKeys,
+		Fence: func() bool {
+			// A single node has no rival; a leader additionally needs a live
+			// lease. Any other role must not continue a leadership-pinned run.
+			role := n.loadRole()
+			if role != roleSingle && role != roleLeader {
+				return false
+			}
+			if role == roleLeader {
+				now := time.Now()
+				if !now.Before(n.leaseDeadline(now)) {
+					return false
+				}
+			}
+			return n.currentTerm() == term
+		},
+		Log: n.log,
+	})
+	res, runErr := runner.Run(gcCtx)
+	if runErr != nil {
+		if errors.Is(runErr, gc.ErrFenced) {
+			n.log.Warnf("t4: object-store GC stopped: leadership generation %d no longer valid", term)
+		} else {
+			n.log.Warnf("t4: object-store gc: %v", runErr)
+		}
+		return
+	}
+	c := res.Counts()
+	if c.CheckpointsDeleted > 0 {
+		n.log.Infof("t4: checkpoint gc: deleted %d old checkpoint(s)", c.CheckpointsDeleted)
+	}
+	if c.SSTsDeleted > 0 {
+		n.log.Infof("t4: sst gc: deleted %d orphan sst(s)", c.SSTsDeleted)
+	}
+	if c.WALsDeleted > 0 {
+		metrics.WALGCTotal.Add(float64(c.WALsDeleted))
+		n.log.Infof("t4: wal gc: deleted %d segment(s) covered by seq=%d", c.WALsDeleted, res.WALHorizonSeq)
+	}
+	if res.Status == gc.StatusFailed {
+		n.log.Warnf("t4: object-store gc run %s incomplete: %s (%d item(s) unconfirmed); will resume next round",
+			res.ID, res.Error, c.Pending)
+	}
+}
+
+// liveSSTKeys reports content-addressed SST keys for tables the current
+// database still holds on disk. It feeds the GC SST phase so the same table
+// content a live node needs is never removed, even when an older plan had it
+// as an orphan candidate.
+func (n *Node) liveSSTKeys() map[string]struct{} {
+	live := make(map[string]struct{})
+	if n.sstUploader == nil {
+		return live
+	}
+	for name, key := range n.sstUploader.Registry() {
+		if _, err := os.Stat(filepath.Join(n.cfg.DataDir, "db", name)); err == nil {
+			live[key] = struct{}{}
+		}
+	}
+	return live
 }
 
 // sweepSSTs deletes SSTs that no checkpoint references and that are not live
