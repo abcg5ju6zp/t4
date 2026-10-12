@@ -393,6 +393,10 @@ func Open(cfg Config) (*Node, error) {
 	// inheritedSSTs is populated during BranchPoint restore: maps SST filename
 	// to the source store's S3 key.  Applied to the SSTUploader after open.
 	var inheritedSSTs map[string]string
+	// recovery is non-nil while an automatic recovery from a broken
+	// manifest/latest is in flight; the remote-WAL replay block finishes it by
+	// conditionally repairing the manifest after replay converges.
+	var recovery *recoveryState
 
 	// A single node that already has local data does not need the object
 	// store to start: its local data is authoritative, and the object store
@@ -403,13 +407,21 @@ func Open(cfg Config) (*Node, error) {
 	objectStoreDown := false
 	if cfg.ObjectStore != nil && cfg.PeerListenAddr == "" && cfg.RestorePoint == nil && cfg.BranchPoint == nil {
 		if _, err := os.Stat(pebbleDir); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), startupObjectStoreProbeTimeout)
-			_, perr := cp.ReadManifest(ctx, cfg.ObjectStore)
-			cancel()
-			if perr != nil {
-				objectStoreDown = true
-				log.Errorf("t4: object store unreachable at startup (%v); starting from local data only. "+
-					"Entries the object store holds beyond local data, if any, are not replayed", perr)
+			// A recovery in flight owns this start: its manifest is known to be
+			// missing/corrupt, so a manifest read failure here is the expected
+			// state, not an outage. Falling back to local-only data would skip
+			// the pinned replay and the conditional manifest repair, and could
+			// serve a half-recovered directory. Bootstrap must run to completion.
+			recoveryState, _ := loadRecoveryState(cfg.DataDir)
+			if recoveryState == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), startupObjectStoreProbeTimeout)
+				_, perr := cp.ReadManifest(ctx, cfg.ObjectStore)
+				cancel()
+				if perr != nil {
+					objectStoreDown = true
+					log.Errorf("t4: object store unreachable at startup (%v); starting from local data only. "+
+						"Entries the object store holds beyond local data, if any, are not replayed", perr)
+				}
 			}
 		}
 	}
@@ -467,46 +479,16 @@ func Open(cfg Config) (*Node, error) {
 			}
 		}
 	case cfg.ObjectStore != nil && !objectStoreDown:
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), recoveryBaselineTimeout)
 		defer cancel()
-		manifest, err := cp.ReadManifest(ctx, cfg.ObjectStore)
-		if err != nil {
-			return nil, fmt.Errorf("t4: read manifest: %w", err)
+		var rerr error
+		recovery, rerr = bootstrapCheckpointBaseline(ctx, &cfg, cp, pebbleDir, log)
+		if rerr != nil {
+			return nil, rerr
 		}
-		if manifest != nil {
-			log.Infof("t4: manifest found (rev=%d)", manifest.Revision)
-			if _, err := os.Stat(pebbleDir); errors.Is(err, os.ErrNotExist) {
-				// Retry loop: the checkpoint referenced by the manifest may
-				// have been GC'd in the window between reading the manifest
-				// and downloading it (most commonly when two leaders are
-				// concurrently writing checkpoints during a leadership
-				// transition). Re-reading the manifest gives us whichever
-				// checkpoint the new leader most recently wrote.
-				for attempt := 0; ; attempt++ {
-					t, rev, rerr := cp.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
-					if rerr == nil {
-						term, startRev = t, rev
-						log.Infof("t4: checkpoint restored (term=%d rev=%d)", term, startRev)
-						break
-					}
-					if !errors.Is(rerr, object.ErrNotFound) || attempt >= 4 {
-						return nil, fmt.Errorf("t4: restore checkpoint: %w", rerr)
-					}
-					// Checkpoint was GC'd; sleep briefly so the leader can
-					// write a new checkpoint and update the manifest before
-					// we retry. (With a 400 ms checkpoint interval, 500 ms
-					// gives a full interval of headroom.)
-					log.Warnf("t4: checkpoint %q not found, re-reading manifest (attempt %d/5)", manifest.CheckpointKey, attempt+1)
-					time.Sleep(500 * time.Millisecond)
-					manifest, err = cp.ReadManifest(ctx, cfg.ObjectStore)
-					if err != nil {
-						return nil, fmt.Errorf("t4: read manifest: %w", err)
-					}
-					if manifest == nil {
-						break // manifest disappeared; start fresh without checkpoint
-					}
-				}
-			}
+		if recovery != nil {
+			log.Infof("t4: recovered checkpoint baseline %s (term=%d rev=%d); WAL replay follows",
+				recovery.IndexKey, recovery.Term, recovery.Revision)
 		}
 	}
 
@@ -656,7 +638,16 @@ func Open(cfg Config) (*Node, error) {
 			// that same GC event means a fresh checkpoint exists.  Re-restoring
 			// from that checkpoint is the correct recovery; returning the error
 			// directly would cause Open() to fail unnecessarily.
-			freshManifest, merr := cp.ReadManifest(ctx, cfg.ObjectStore)
+			//
+			// A missing or corrupt manifest yields a nil freshManifest: while an
+			// automatic recovery is underway the manifest is not repaired until
+			// replay converges, so a replay hole in that window is an explicit
+			// failure rather than a reason to invent a checkpoint.
+			mst, merr := cp.ReadManifestStatus(ctx, cfg.ObjectStore)
+			var freshManifest *checkpoint.Manifest
+			if merr == nil && mst != nil && mst.Manifest != nil {
+				freshManifest = mst.Manifest
+			}
 
 			if replayErr != nil {
 				// If the checkpoint has not advanced there is no recovery path —
@@ -692,6 +683,22 @@ func Open(cfg Config) (*Node, error) {
 			for attempt := range 5 {
 				newTerm, newRev, err = cp.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
 				if err == nil {
+					// Never swap in a checkpoint the manifest points at but
+					// whose objects are incomplete/corrupt: verify the on-disk
+					// result before opening it as the live database.
+					if verr := cp.VerifyRestoredDirectory(pebbleDir); verr != nil {
+						_ = os.RemoveAll(pebbleDir)
+						if recovery != nil {
+							// Force the next boot to re-stage the pinned
+							// candidate from object evidence instead of
+							// trusting the removed directory.
+							recovery.Staged = false
+							_ = recovery.save(cfg.DataDir)
+						}
+						w.Close()
+						return nil, fmt.Errorf("t4: remote WAL replay gap cannot be closed: checkpoint %q from the fresher manifest is unusable: %w",
+							manifest.CheckpointKey, verr)
+					}
 					break
 				}
 				if !errors.Is(err, object.ErrNotFound) || attempt >= 4 {
@@ -737,6 +744,26 @@ func Open(cfg Config) (*Node, error) {
 			}
 			db, term, startRev, nextSeq = freshDB, newTerm, freshDB.CurrentRevision(), reopenSeq
 			log.Infof("t4: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
+		}
+
+		// Replay converged on a single coherent revision. If bootstrap
+		// recovered from a broken manifest, publish the repair now —
+		// conditionally, so a newer valid manifest a peer wrote meanwhile is
+		// never overwritten. Nothing short of this point published any
+		// half-recovered state to object storage.
+		if recovery != nil {
+			// The repair decision may fully verify (download) a concurrently
+			// published candidate, so give it its own generous budget instead
+			// of inheriting the WAL-replay deadline.
+			repairCtx, repairCancel := context.WithTimeout(context.Background(), recoveryBaselineTimeout)
+			rerr := completeManifestRecovery(repairCtx, &cfg, cp, log, recovery)
+			repairCancel()
+			if rerr != nil {
+				w.Close()
+				db.Close()
+				return nil, fmt.Errorf("t4: repair manifest after recovery: %w", rerr)
+			}
+			recovery = nil
 		}
 	}
 

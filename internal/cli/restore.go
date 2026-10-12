@@ -83,6 +83,14 @@ func restoreCheckpointCmd() *cobra.Command {
 By default the latest checkpoint is used. Pass --checkpoint to restore
 from a specific earlier revision (use 't4 restore list' to find keys).
 
+If manifest/latest is missing, truncated, or points at an incomplete
+checkpoint, every existing checkpoint is scanned and validated (index,
+SST objects, Pebble metadata and coverage); the highest-revision complete
+checkpoint is restored, and manifest/latest is repaired with a
+conditional write. Candidates with missing objects, checksum failures or
+unknown formats are skipped with a logged reason. An explicit --checkpoint
+never triggers a scan or a manifest repair.
+
 After this command succeeds, start the node with:
 
   t4 run --data-dir <data-dir> [--s3-bucket <bucket>] ...
@@ -106,15 +114,60 @@ replaying newer WAL from S3, omit --s3-bucket entirely.`,
 
 			key := checkpointKey
 			if key == "" {
-				manifest, err := cp.ReadManifest(ctx, store)
+				// Default: use manifest/latest. If it is missing, truncated, or
+				// otherwise unusable, scan every checkpoint, verify index/SSTs/
+				// Pebble metadata, and take the highest-revision complete one —
+				// then repair manifest/latest conditionally. An explicit
+				// --checkpoint skips both scan and repair.
+				status, err := cp.ReadManifestStatus(ctx, store)
 				if err != nil {
 					return fmt.Errorf("read manifest: %w", err)
 				}
-				if manifest == nil {
-					return fmt.Errorf("no checkpoints found in s3://%s/%s", s3.Bucket, s3.Prefix)
+				switch {
+				case status.Manifest != nil:
+					key = status.Manifest.CheckpointKey
+					logrus.Infof("using latest checkpoint: %s (rev=%d)", key, status.Manifest.Revision)
+				default:
+					stagingDir := pebbleDir + ".recover"
+					cand, skipped, err := cp.RecoverLatest(ctx, store, nil, stagingDir)
+					if err != nil {
+						return fmt.Errorf("scan checkpoints: %w", err)
+					}
+					if cand == nil {
+						if status.Corrupt {
+							return fmt.Errorf("manifest/latest is unusable (%s) and no complete checkpoint was found", status.Reason)
+						}
+						return fmt.Errorf("no checkpoints found in s3://%s/%s", s3.Bucket, s3.Prefix)
+					}
+					for _, rj := range skipped {
+						logrus.Warnf("skipping checkpoint %s: %s", rj.IndexKey, rj.Reason)
+					}
+					if err := os.Rename(stagingDir, pebbleDir); err != nil {
+						return fmt.Errorf("install recovered checkpoint: %w", err)
+					}
+					m := cand.Manifest()
+					outcome, err := cp.RepairManifest(ctx, store, m, func(cur *checkpoint.Manifest) error {
+						return cp.VerifyCheckpointComplete(ctx, store, nil, cur.CheckpointKey)
+					})
+					if err != nil {
+						return fmt.Errorf("repair manifest after recovery: %w", err)
+					}
+					if outcome.Written {
+						logrus.Infof("manifest/latest repaired to %s", cand.IndexKey)
+					} else {
+						logrus.Infof("manifest/latest already points to a valid newer checkpoint; left untouched")
+					}
+					out := cmd.OutOrStdout()
+					fmt.Fprintf(out, "Recovered checkpoint\n")
+					fmt.Fprintf(out, "  key:       %s\n", cand.IndexKey)
+					fmt.Fprintf(out, "  revision:  %d\n", cand.Index.Revision)
+					fmt.Fprintf(out, "  term:      %d\n", cand.Index.Term)
+					fmt.Fprintf(out, "  data-dir:  %s\n", dataDir)
+					fmt.Fprintf(out, "  skipped:   %d incomplete candidate(s)\n", len(skipped))
+					fmt.Fprintf(out, "\nStart the restored node:\n")
+					fmt.Fprintf(out, "  t4 run --data-dir %s [--s3-bucket <new-bucket>] --listen 0.0.0.0:3379\n", dataDir)
+					return nil
 				}
-				key = manifest.CheckpointKey
-				logrus.Infof("using latest checkpoint: %s (rev=%d)", key, manifest.Revision)
 			}
 
 			logrus.Infof("restoring checkpoint %q → %s", key, pebbleDir)
